@@ -151,108 +151,45 @@ class HAEFNet(nn.Module):
             # 如果不使用证据融合，直接返回HARMF结果
             return harmf_outputs, aux_loss
 
-        # 2. 提取HARMF编码器的中间特征
-        # 这里需要修改HARMF编码器以返回中间特征
-        # 暂时使用解码器输入作为特征
-        modality_features = self.harmf_encoder.encoder(x)
+        # 2. 串联式证据决策：以解码器融合特征为输入（对齐原实现）
+        # 从 WeTr.decoder 暴露的 last_fused 取特征（已与最浅层对齐到 H/4,W/4）
+        fused_feature = getattr(self.harmf_encoder.decoder, "last_fused", None)
 
-        # 3. 应用GEM-Layer进行证据映射（可选用MRG对每模态pl进行折扣后再融合）
-        evidence_maps = []
-        uncertainty_maps = []
-
-        for stage_idx in range(len(self.feature_dims)):
-            stage_evidence = []
-            stage_uncertainty = []
-            stage_pl_list = []  # 若启用ECD，每模态折扣后的pl
-
-            # 对每个模态应用GEM-Layer
-            for mod_idx in range(self.num_parallel):
-                if mod_idx < len(modality_features) and stage_idx < len(modality_features[mod_idx]):
-                    feat = modality_features[mod_idx][stage_idx]  # [B, C, H, W]
-
-                    # 特征投影到统一维度
-                    projected_feat = self.feature_projections[stage_idx](feat)
-
-                    # 应用GEM-Layer，得到质量函数
-                    mass = self.gem_layers[stage_idx](projected_feat)  # [B,K+1,H,W]
-                    uncertainty = self.gem_layers[stage_idx].get_uncertainty(mass)
-
-                    if self.use_mrg:
-                        # 转换为pl，做MRG折扣
-                        pl = self.gem_layers[stage_idx].get_plausibility(mass)  # [B,K,H,W]
-                        pl_hat = self.mrg(pl, modality_index=mod_idx)  # [B,K,H,W]
-                        if self.use_evidential_combination:
-                            stage_pl_list.append(pl_hat)
-                        # 将pl_hat转换回质量函数的单点近似：分配到单例，Theta=1-max(pl_hat)
-                        # 简化：mass_approx = [pl_hat; 1 - max(pl_hat, dim=1)]
-                        theta = (1.0 - pl_hat.max(1, keepdim=True)[0]).clamp(min=0.0)
-                        mass = torch.cat([pl_hat, theta], dim=1)
-
-                    stage_evidence.append(mass)
-                    stage_uncertainty.append(uncertainty)
-
-            if stage_evidence:
-                # 平均融合各模态的证据
-                if self.use_evidential_combination and self.use_mrg and len(stage_pl_list) > 0:
-                    # ECD：按Dempster规则的pl乘积后归一化，再转近似mass
-                    fused_pl = fuse_discounted_plausibilities(stage_pl_list)  # [B,K,H,W]
-                    fused_prob = normalize_pl_to_prob(fused_pl)  # [B,K,H,W]
-                    theta = (1.0 - fused_prob.max(1, keepdim=True)[0]).clamp(min=0.0)
-                    avg_evidence = torch.cat([fused_prob, theta], dim=1)  # [B,K+1,H,W]
-                else:
-                    avg_evidence = torch.stack(stage_evidence, dim=0).mean(dim=0)
-                avg_uncertainty = torch.stack(stage_uncertainty, dim=0).mean(dim=0)
-
-                evidence_maps.append(avg_evidence)
-                uncertainty_maps.append(avg_uncertainty)
-
-        # 4. 多尺度证据融合
-        if evidence_maps:
-            # 将不同stage的证据图调整到相同尺寸
-            target_size = evidence_maps[0].shape[2:]
-            resized_evidence = []
-
-            for evidence in evidence_maps:
-                if evidence.shape[2:] != target_size:
-                    evidence = F.interpolate(evidence, size=target_size, mode="bilinear", align_corners=False)
-                resized_evidence.append(evidence)
-
-            # 拼接所有stage的证据（若使用MRG，已是折扣后的质量函数）
-            concatenated_evidence = torch.cat(resized_evidence, dim=1)  # [B, (K+1)*num_stages, H, W]
-
-            # 通过融合网络得到最终输出
-            evidential_output = self.evidential_fusion(concatenated_evidence)
-
-            # 调整输出尺寸
-            if evidential_output.shape[2:] != original_shape:
-                evidential_output = F.interpolate(
-                    evidential_output, size=original_shape, mode="bilinear", align_corners=False
-                )
-
-            # 计算平均不确定性
-            if uncertainty_maps:
-                # 将各stage不确定性插值到共同尺寸再聚合
-                target_size = evidence_maps[0].shape[2:]
-                resized_uncertainties = []
-                for u in uncertainty_maps:
-                    if u.shape[2:] != target_size:
-                        u = F.interpolate(u, size=target_size, mode="bilinear", align_corners=False)
-                    resized_uncertainties.append(u)
-                avg_uncertainty = torch.stack(resized_uncertainties, dim=0).mean(dim=0)
-                if avg_uncertainty.shape[2:] != original_shape:
-                    avg_uncertainty = F.interpolate(
-                        avg_uncertainty, size=original_shape, mode="bilinear", align_corners=False
-                    )
-            else:
-                avg_uncertainty = torch.zeros(
-                    evidential_output.shape[0], 1, *original_shape, device=evidential_output.device
-                )
-
-            # 返回HARMF输出和证据融合输出
-            return [harmf_outputs[0], evidential_output], aux_loss
-        else:
-            # 如果没有证据图，返回HARMF结果
+        if fused_feature is None:
+            # 兼容：若未暴露，则退化为使用harmf输出前一层特征，不中断训练
             return harmf_outputs, aux_loss
+
+        # 单一路径证据映射（不再做多尺度并行），保持与原作“解码后”一致
+        # decoder.last_fused 已为 256 通道，直接输入 GEM
+        gem = self.gem_layers[0]
+        mass = gem(fused_feature)  # [B,K+1,H/4,W/4]
+        theta_map = gem.get_uncertainty(mass)  # [B,1,H/4,W/4]
+
+        # 可选：MRG + ECD（此处跨模态已在编码阶段融合，若仍保留多源，可在上游提供多源fused_feature列表）
+        if self.use_mrg:
+            pl = gem.get_plausibility(mass)  # [B,K,H/4,W/4]
+            # 这里只有“聚合后特征”，如需分模态折扣，需改为在解码前保持分模态分支特征
+            pl_hat = self.mrg(pl, modality_index=0)
+            if self.use_evidential_combination:
+                fused_pl = pl_hat
+                fused_prob = normalize_pl_to_prob(fused_pl)
+                theta = (1.0 - fused_prob.max(1, keepdim=True)[0]).clamp(min=0.0)
+                mass = torch.cat([fused_prob, theta], dim=1)
+            else:
+                theta = (1.0 - pl_hat.max(1, keepdim=True)[0]).clamp(min=0.0)
+                mass = torch.cat([pl_hat, theta], dim=1)
+
+        # 简单双头输出：保留原HARMF输出 + 证据分支（上采样到原图）
+        evidential_output = mass[:, : self.num_classes, :, :]
+        if evidential_output.shape[2:] != original_shape:
+            evidential_output = F.interpolate(
+                evidential_output, size=original_shape, mode="bilinear", align_corners=False
+            )
+
+        if theta_map.shape[2:] != original_shape:
+            theta_map = F.interpolate(theta_map, size=original_shape, mode="bilinear", align_corners=False)
+
+        return [harmf_outputs[0], evidential_output], aux_loss
 
     def get_uncertainty_map(self, x):
         """

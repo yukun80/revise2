@@ -82,6 +82,9 @@ class SegFormerHead(nn.Module):
 
         _c = self.linear_fuse(torch.cat([_c4, _c3, _c2, _c1], dim=1))
 
+        # Expose fused decoder feature before classifier for downstream modules (e.g., evidential branch)
+        self.last_fused = _c
+
         x = self.dropout(_c)
         x = self.linear_pred(x)
 

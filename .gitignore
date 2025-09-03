@@ -7,3 +7,4 @@ mmcv_custom/
 pretrained/
 *.tif
 logs/
+README.md

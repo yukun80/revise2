@@ -48,7 +48,9 @@ model:
   num_modalities: 3
   pretrained: true
   type: haefnet
+  use_evidential_combination: true
   use_evidential_fusion: true
+  use_mrg: true
 prediction:
   model_path: checkpoints/HAEFNet_test_20250903/model_epoch_20.pth
   output_dir: work_dir/HAEFNet_test_20250903_pred_best

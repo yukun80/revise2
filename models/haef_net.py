@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .segformer import WeTr
 from .geo_evidential_mapping import GeoEvidentialMappingLayer, plausibility_to_probability
+from .modality_reliability_gating import ModalityReliabilityGating
+from .evidential_combination import fuse_discounted_plausibilities, normalize_pl_to_prob
 
 
 class HAEFNet(nn.Module):
@@ -27,12 +29,16 @@ class HAEFNet(nn.Module):
         gem_geo_prior_weight=0.1,
         # 是否使用证据融合
         use_evidential_fusion=True,
+        use_mrg=False,
+        use_evidential_combination=False,
     ):
         super().__init__()
 
         self.num_classes = num_classes
         self.num_parallel = num_parallel
         self.use_evidential_fusion = use_evidential_fusion
+        self.use_mrg = use_mrg
+        self.use_evidential_combination = use_evidential_combination
 
         print("-----------------HAEF-Net Params--------------------------------------")
         print("backbone:", backbone)
@@ -95,6 +101,10 @@ class HAEFNet(nn.Module):
                 nn.Conv2d(256, num_classes, 1),
             )
 
+            # MRG: 可选，按模态/类别学习可靠性并做上下文化折扣
+            if self.use_mrg:
+                self.mrg = ModalityReliabilityGating(num_classes=self.num_classes, num_modalities=self.num_parallel)
+
     def get_param_groups(self):
         """获取参数组，用于优化器设置"""
         param_groups = [[], [], []]  # encoder, norm, decoder
@@ -146,13 +156,14 @@ class HAEFNet(nn.Module):
         # 暂时使用解码器输入作为特征
         modality_features = self.harmf_encoder.encoder(x)
 
-        # 3. 应用GEM-Layer进行证据映射
+        # 3. 应用GEM-Layer进行证据映射（可选用MRG对每模态pl进行折扣后再融合）
         evidence_maps = []
         uncertainty_maps = []
 
         for stage_idx in range(len(self.feature_dims)):
             stage_evidence = []
             stage_uncertainty = []
+            stage_pl_list = []  # 若启用ECD，每模态折扣后的pl
 
             # 对每个模态应用GEM-Layer
             for mod_idx in range(self.num_parallel):
@@ -162,16 +173,34 @@ class HAEFNet(nn.Module):
                     # 特征投影到统一维度
                     projected_feat = self.feature_projections[stage_idx](feat)
 
-                    # 应用GEM-Layer
-                    mass = self.gem_layers[stage_idx](projected_feat)
+                    # 应用GEM-Layer，得到质量函数
+                    mass = self.gem_layers[stage_idx](projected_feat)  # [B,K+1,H,W]
                     uncertainty = self.gem_layers[stage_idx].get_uncertainty(mass)
+
+                    if self.use_mrg:
+                        # 转换为pl，做MRG折扣
+                        pl = self.gem_layers[stage_idx].get_plausibility(mass)  # [B,K,H,W]
+                        pl_hat = self.mrg(pl, modality_index=mod_idx)  # [B,K,H,W]
+                        if self.use_evidential_combination:
+                            stage_pl_list.append(pl_hat)
+                        # 将pl_hat转换回质量函数的单点近似：分配到单例，Theta=1-max(pl_hat)
+                        # 简化：mass_approx = [pl_hat; 1 - max(pl_hat, dim=1)]
+                        theta = (1.0 - pl_hat.max(1, keepdim=True)[0]).clamp(min=0.0)
+                        mass = torch.cat([pl_hat, theta], dim=1)
 
                     stage_evidence.append(mass)
                     stage_uncertainty.append(uncertainty)
 
             if stage_evidence:
                 # 平均融合各模态的证据
-                avg_evidence = torch.stack(stage_evidence, dim=0).mean(dim=0)
+                if self.use_evidential_combination and self.use_mrg and len(stage_pl_list) > 0:
+                    # ECD：按Dempster规则的pl乘积后归一化，再转近似mass
+                    fused_pl = fuse_discounted_plausibilities(stage_pl_list)  # [B,K,H,W]
+                    fused_prob = normalize_pl_to_prob(fused_pl)  # [B,K,H,W]
+                    theta = (1.0 - fused_prob.max(1, keepdim=True)[0]).clamp(min=0.0)
+                    avg_evidence = torch.cat([fused_prob, theta], dim=1)  # [B,K+1,H,W]
+                else:
+                    avg_evidence = torch.stack(stage_evidence, dim=0).mean(dim=0)
                 avg_uncertainty = torch.stack(stage_uncertainty, dim=0).mean(dim=0)
 
                 evidence_maps.append(avg_evidence)
@@ -188,7 +217,7 @@ class HAEFNet(nn.Module):
                     evidence = F.interpolate(evidence, size=target_size, mode="bilinear", align_corners=False)
                 resized_evidence.append(evidence)
 
-            # 拼接所有stage的证据
+            # 拼接所有stage的证据（若使用MRG，已是折扣后的质量函数）
             concatenated_evidence = torch.cat(resized_evidence, dim=1)  # [B, (K+1)*num_stages, H, W]
 
             # 通过融合网络得到最终输出

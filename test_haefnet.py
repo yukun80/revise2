@@ -69,6 +69,8 @@ def test_haefnet():
             "gem_prototype_dim": 10,
             "gem_geo_prior_weight": 0.1,
             "use_evidential_fusion": True,
+            "use_mrg": True,
+            "use_evidential_combination": True,
             "drop_path_rate": 0.1,
             "drop_rate": 0.0,
             "n_heads": 8,

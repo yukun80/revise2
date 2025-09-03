@@ -1,0 +1,9 @@
+checkpoints/
+data/
+Deep-evidential-fusion/
+doc/
+__pycache__/
+mmcv_custom/
+pretrained/
+*.tif
+logs/

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import logging
 from models.segformer import WeTr, TransformerBackbone
+from models.haef_net import HAEFNet
 
 
 def create_model(config):
@@ -28,7 +29,7 @@ def create_model(config):
     print(f"Creating {model_type} model with {num_modalities} modalities: {modalities}")
     print(f"Modality dimensions: {modality_dims}")
 
-    if model_type in ["segformer", "wetr", "geminifusion"]:
+    if model_type in ["segformer", "wetr", "geminifusion", "haefnet"]:
         # Set the number of modalities in modules.py
         from models.modules import set_num_parallel
 
@@ -61,17 +62,37 @@ def create_model(config):
         if backbone.startswith("swin"):
             mmdet_logger.setLevel(original_level)
 
-        # Create WeTr with Swin or MiT backbone and PixelCrossAttention fusion
-        print("Creating model with PixelCrossAttention fusion")
-        model = WeTr(
-            backbone=backbone,
-            num_classes=num_classes,
-            n_heads=n_heads,
-            dpr=dpr,
-            drop_rate=drop_rate,
-            num_parallel=num_modalities,
-            fusion_params=fusion_params,
-        )
+        # Create model based on type
+        if model_type == "haefnet":
+            print("Creating HAEF-Net with evidential fusion")
+            # GEM-Layer参数
+            gem_prototype_dim = config["model"].get("gem_prototype_dim", 20)
+            gem_geo_prior_weight = config["model"].get("gem_geo_prior_weight", 0.1)
+            use_evidential_fusion = config["model"].get("use_evidential_fusion", True)
+
+            model = HAEFNet(
+                backbone=backbone,
+                num_classes=num_classes,
+                n_heads=n_heads,
+                dpr=dpr,
+                drop_rate=drop_rate,
+                num_parallel=num_modalities,
+                fusion_params=fusion_params,
+                gem_prototype_dim=gem_prototype_dim,
+                gem_geo_prior_weight=gem_geo_prior_weight,
+                use_evidential_fusion=use_evidential_fusion,
+            )
+        else:
+            print("Creating model with PixelCrossAttention fusion")
+            model = WeTr(
+                backbone=backbone,
+                num_classes=num_classes,
+                n_heads=n_heads,
+                dpr=dpr,
+                drop_rate=drop_rate,
+                num_parallel=num_modalities,
+                fusion_params=fusion_params,
+            )
 
         # Initialize from pretrained weights if available
         if config["model"].get("pretrained", False):

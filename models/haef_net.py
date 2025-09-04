@@ -234,10 +234,33 @@ class HAEFNet(nn.Module):
             stage_uncertainty = []
             stage_probs = []
 
-            # 对每个模态应用 GEM
+            # 收集该stage的各模态特征，并执行一次与 WeTr.forward 相同的 PCA 交互更新（不做模态均值）
+            num_modalities = len(modality_features)
+            stage_feats = []
+            for m in range(num_modalities):
+                if stage_idx < len(modality_features[m]):
+                    stage_feats.append(modality_features[m][stage_idx])
+
+            if not stage_feats:
+                continue
+
+            B, C, Hs, Ws = stage_feats[0].shape
+            seqs = [f.permute(0, 2, 3, 1).reshape(B, Hs * Ws, C) for f in stage_feats]
+
+            updated_seqs = list(seqs)
+            for m in range(num_modalities):
+                nxt = (m + 1) % num_modalities
+                y_m, y_n = self.harmf_encoder.pca_stages[stage_idx](updated_seqs[m], updated_seqs[nxt])
+                updated_seqs[m], updated_seqs[nxt] = y_m, y_n
+
+            updated_feats = [
+                updated_seqs[m].reshape(B, Hs, Ws, C).permute(0, 3, 1, 2).contiguous() for m in range(num_modalities)
+            ]
+
+            # 对每个模态应用 GEM（基于经PCA交互后的每模态特征）
             for mod_idx in range(self.num_parallel):
-                if mod_idx < len(modality_features) and stage_idx < len(modality_features[mod_idx]):
-                    feat = modality_features[mod_idx][stage_idx]  # [B, C, H, W]
+                if mod_idx < len(updated_feats):
+                    feat = updated_feats[mod_idx]  # [B, C, H, W]
 
                     # 应用 GEM-Layer
                     gem = self.gem_layers[stage_idx]

@@ -57,18 +57,16 @@ prediction:
 training:
   batch_size: 8
   ckpt_dir: checkpoints/
-  current_time: '20250903'
+  current_time: '20250904'
   learning_rate: 1.0e-05
   log_dir: logs/
   loss:
     ignore_index: 255
     losses:
-    - gamma: 2.0
-      name: focal
-      weight: 0.7
-    - name: boundary
-      theta: 3.0
-      weight: 0.3
+    - name: cross_entropy
+      weight: 1.0
+    - name: dice
+      weight: 1.0
     type: combined
   name: HAEFNet_test
   num_epochs: 50

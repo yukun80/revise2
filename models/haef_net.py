@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .segformer import WeTr
-from .geo_evidential_mapping import GeoEvidentialMappingLayer, plausibility_to_probability
+from .geo_evidential_mapping import GeoEvidentialMappingLayer
 from .modality_reliability_gating import ModalityReliabilityGating
 from .evidential_combination import fuse_discounted_plausibilities, normalize_pl_to_prob
 
@@ -73,35 +73,39 @@ class HAEFNet(nn.Module):
             # 对于MiT backbone，使用默认维度
             self.feature_dims = [128, 256, 512, 1024]
 
-        # 2. GEM-Layer (地理证据映射层)
+        # 2. 多尺度 GEM（编码器各阶段，对齐 Swin 架构）
         if self.use_evidential_fusion:
-            # 为每个模态创建独立的GEM-Layer
-            # 先将各stage特征通过1x1投影到统一的256维，再送入GEM-Layer
-            # 因此GEM-Layer的input_dim固定为256，避免通道不匹配
+            # 为每个编码器阶段创建 GEM 层
             self.gem_layers = nn.ModuleList(
                 [
                     GeoEvidentialMappingLayer(
-                        input_dim=256,
+                        input_dim=dim,
                         prototype_dim=gem_prototype_dim,
                         class_dim=num_classes,
                         geo_prior_weight=gem_geo_prior_weight,
                     )
-                    for _ in self.feature_dims
+                    for dim in self.feature_dims
                 ]
             )
 
-            # 特征投影层，将不同stage的特征投影到统一维度
-            self.feature_projections = nn.ModuleList([nn.Conv2d(dim, 256, 1) for dim in self.feature_dims])
+            # 每个stage的轻量监督头：将[K+1]质量映射到[K] logits
+            self.stage_heads = nn.ModuleList(
+                [nn.Conv2d(self.num_classes + 1, self.num_classes, kernel_size=1) for _ in self.feature_dims]
+            )
 
-            # 最终融合层：输入为各stage的证据图拼接，通道数为 (K+1) * num_stages
+            # 每个stage的PCA融合特征监督头：从C_s -> K logits
+            self.pca_stage_heads = nn.ModuleList(
+                [nn.Conv2d(dim, self.num_classes, kernel_size=1) for dim in self.feature_dims]
+            )
+
+            # 多尺度概率融合层（输入为每个stage的K通道概率）
             self.evidential_fusion = nn.Sequential(
-                nn.Conv2d((self.num_classes + 1) * len(self.feature_dims), 256, 3, padding=1),
+                nn.Conv2d((self.num_classes) * len(self.feature_dims), 256, 3, padding=1),
                 nn.BatchNorm2d(256),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(256, num_classes, 1),
             )
 
-            # MRG: 可选，按模态/类别学习可靠性并做上下文化折扣
             if self.use_mrg:
                 self.mrg = ModalityReliabilityGating(num_classes=self.num_classes, num_modalities=self.num_parallel)
 
@@ -116,20 +120,90 @@ class HAEFNet(nn.Module):
             else:
                 param_groups[0].append(param)
 
-        # GEM-Layer参数
+        # GEM 参数 (使用更高学习率)
         if self.use_evidential_fusion:
             for gem_layer in self.gem_layers:
                 for param in gem_layer.parameters():
                     param_groups[2].append(param)
 
-            for proj in self.feature_projections:
-                for param in proj.parameters():
-                    param_groups[2].append(param)
-
+            # 证据融合层参数
             for param in self.evidential_fusion.parameters():
                 param_groups[2].append(param)
 
+            # 深监督头参数
+            for param in self.stage_heads.parameters():
+                param_groups[2].append(param)
+            for param in self.pca_stage_heads.parameters():
+                param_groups[2].append(param)
+
+            # MRG 参数
+            if self.use_mrg:
+                for param in self.mrg.parameters():
+                    param_groups[2].append(param)
+
         return param_groups
+
+    def _dempster_combination(self, evidence_list):
+        """
+        使用Dempster组合规则融合多个证据质量函数
+
+        Args:
+            evidence_list: List of [B, K+1, H, W] mass functions
+        Returns:
+            combined_evidence: [B, K+1, H, W] 组合后的质量函数
+        """
+        if len(evidence_list) == 1:
+            return evidence_list[0]
+
+        # 初始化组合结果
+        combined = evidence_list[0]
+
+        # 逐个组合证据
+        for evidence in evidence_list[1:]:
+            combined = self._dempster_combine_two(combined, evidence)
+
+        return combined
+
+    def _dempster_combine_two(self, m1, m2):
+        """
+        使用Dempster组合规则组合两个质量函数
+
+        Args:
+            m1, m2: [B, K+1, H, W] mass functions
+        Returns:
+            combined: [B, K+1, H, W] 组合后的质量函数
+        """
+        B, K_plus_1, H, W = m1.shape
+        K = K_plus_1 - 1  # 类别数
+        m1_theta = m1[:, -1:, :, :]  # [B, 1, H, W]
+        m2_theta = m2[:, -1:, :, :]  # [B, 1, H, W]
+        m1_singletons = m1[:, :-1, :, :]  # [B, K, H, W]
+        m2_singletons = m2[:, :-1, :, :]  # [B, K, H, W]
+
+        # 冲突 K = Σ_{i≠j} m1({i}) m2({j})
+        sum_m1 = m1_singletons.sum(dim=1, keepdim=True)  # [B,1,H,W]
+        sum_m2 = m2_singletons.sum(dim=1, keepdim=True)  # [B,1,H,W]
+        diag = (m1_singletons * m2_singletons).sum(dim=1, keepdim=True)  # [B,1,H,W]
+        conflict = (sum_m1 * sum_m2) - diag  # [B,1,H,W]
+
+        # 归一化分母 1 - K，数值稳定
+        denom = (1.0 - conflict).clamp(min=1e-6)
+
+        # 组合单例（向量化）：m({k}) = [m1_k*m2_k + m1_k*m2_Θ + m1_Θ*m2_k] / (1-K)
+        numer_singletons = (
+            m1_singletons * m2_singletons + m1_singletons * m2_theta + m1_theta * m2_singletons
+        )  # [B,K,H,W]
+        combined_singletons = numer_singletons / denom
+
+        # 组合 Theta：m(Θ) = [m1(Θ) * m2(Θ)] / (1-K)
+        numer_theta = m1_theta * m2_theta  # [B,1,H,W]
+        combined_theta = numer_theta / denom
+
+        combined = torch.cat([combined_singletons, combined_theta], dim=1)
+        # 保险起见再次归一化
+        combined = combined / (combined.sum(dim=1, keepdim=True) + 1e-12)
+
+        return combined
 
     def forward(self, x):
         """
@@ -144,52 +218,97 @@ class HAEFNet(nn.Module):
         # 记录原始输入尺寸
         original_shape = x[0].shape[2:]
 
-        # 1. HARMF编码器前向传播
-        harmf_outputs, aux_loss = self.harmf_encoder(x)
-
+        # 若未启用证据融合，走原HARMF路径；否则仅取encoder特征，避免重复图构建
         if not self.use_evidential_fusion:
-            # 如果不使用证据融合，直接返回HARMF结果
-            return harmf_outputs, aux_loss
+            return self.harmf_encoder(x)
 
-        # 2. 串联式证据决策：以解码器融合特征为输入（对齐原实现）
-        # 从 WeTr.decoder 暴露的 last_fused 取特征（已与最浅层对齐到 H/4,W/4）
-        fused_feature = getattr(self.harmf_encoder.decoder, "last_fused", None)
+        # 仅获取编码器多模态多尺度特征（不走WeTr.forward解码路径）
+        modality_features = self.harmf_encoder.encoder(x)
 
-        if fused_feature is None:
-            # 兼容：若未暴露，则退化为使用harmf输出前一层特征，不中断训练
-            return harmf_outputs, aux_loss
+        # 对每个尺度的融合特征应用 GEM
+        evidence_maps = []  # 这里保存每个stage融合后的概率
+        uncertainty_maps = []
 
-        # 单一路径证据映射（不再做多尺度并行），保持与原作“解码后”一致
-        # decoder.last_fused 已为 256 通道，直接输入 GEM
-        gem = self.gem_layers[0]
-        mass = gem(fused_feature)  # [B,K+1,H/4,W/4]
-        theta_map = gem.get_uncertainty(mass)  # [B,1,H/4,W/4]
+        for stage_idx in range(len(self.feature_dims)):
+            stage_evidence = []
+            stage_uncertainty = []
+            stage_probs = []
 
-        # 可选：MRG + ECD（此处跨模态已在编码阶段融合，若仍保留多源，可在上游提供多源fused_feature列表）
-        if self.use_mrg:
-            pl = gem.get_plausibility(mass)  # [B,K,H/4,W/4]
-            # 这里只有“聚合后特征”，如需分模态折扣，需改为在解码前保持分模态分支特征
-            pl_hat = self.mrg(pl, modality_index=0)
-            if self.use_evidential_combination:
-                fused_pl = pl_hat
-                fused_prob = normalize_pl_to_prob(fused_pl)
-                theta = (1.0 - fused_prob.max(1, keepdim=True)[0]).clamp(min=0.0)
-                mass = torch.cat([fused_prob, theta], dim=1)
-            else:
-                theta = (1.0 - pl_hat.max(1, keepdim=True)[0]).clamp(min=0.0)
-                mass = torch.cat([pl_hat, theta], dim=1)
+            # 对每个模态应用 GEM
+            for mod_idx in range(self.num_parallel):
+                if mod_idx < len(modality_features) and stage_idx < len(modality_features[mod_idx]):
+                    feat = modality_features[mod_idx][stage_idx]  # [B, C, H, W]
 
-        # 简单双头输出：保留原HARMF输出 + 证据分支（上采样到原图）
-        evidential_output = mass[:, : self.num_classes, :, :]
-        if evidential_output.shape[2:] != original_shape:
-            evidential_output = F.interpolate(
-                evidential_output, size=original_shape, mode="bilinear", align_corners=False
-            )
+                    # 应用 GEM-Layer
+                    gem = self.gem_layers[stage_idx]
+                    mass = gem(feat)  # [B, K+1, H, W]
+                    uncertainty = gem.get_uncertainty(mass)
 
-        if theta_map.shape[2:] != original_shape:
-            theta_map = F.interpolate(theta_map, size=original_shape, mode="bilinear", align_corners=False)
+                    # 可选：MRG 折扣（对mass进行标准DS折扣）
+                    if self.use_mrg:
+                        mass = self.mrg.discount_mass(mass, modality_index=mod_idx)
 
-        return [harmf_outputs[0], evidential_output], aux_loss
+                    stage_evidence.append(mass)
+                    stage_uncertainty.append(uncertainty)
+
+                    # 生成该模态的概率（mass→pl→prob）用于概率路径融合
+                    pl = gem.get_plausibility(mass)  # [B,K,H,W]
+                    prob = pl / (pl.sum(1, keepdim=True) + 1e-12)
+                    stage_probs.append(prob)
+
+            if stage_probs:
+                # 概率路径（优先）: 按模态乘积并归一化
+                if len(stage_probs) == 1:
+                    fused_prob_s = stage_probs[0]
+                    fused_uncertainty = stage_uncertainty[0]
+                else:
+                    fused_pl_s = stage_probs[0]
+                    for t in range(1, len(stage_probs)):
+                        fused_pl_s = fused_pl_s * stage_probs[t]
+                    fused_prob_s = fused_pl_s / (fused_pl_s.sum(1, keepdim=True) + 1e-12)
+                    fused_uncertainty = torch.stack(stage_uncertainty, dim=0).mean(dim=0)
+
+                # 保存以便多尺度融合（注意这里保存的是概率 K 通道）
+                evidence_maps.append(fused_prob_s)
+                uncertainty_maps.append(fused_uncertainty)
+
+        # 多尺度概率融合
+        if evidence_maps:
+            # 将不同stage的证据图调整到相同尺寸
+            target_size = evidence_maps[0].shape[2:]
+            resized_evidence = []
+
+            for evidence in evidence_maps:
+                if evidence.shape[2:] != target_size:
+                    evidence = F.interpolate(evidence, size=target_size, mode="bilinear", align_corners=False)
+                resized_evidence.append(evidence)
+
+            # 拼接所有stage的概率
+            concatenated_evidence = torch.cat(resized_evidence, dim=1)  # [B, (K)*num_stages, H, W]
+
+            # 通过融合网络得到最终输出
+            evidential_output = self.evidential_fusion(concatenated_evidence)
+
+            # 调整输出尺寸
+            if evidential_output.shape[2:] != original_shape:
+                evidential_output = F.interpolate(
+                    evidential_output, size=original_shape, mode="bilinear", align_corners=False
+                )
+
+            # 注意：返回原始logits以便与CrossEntropyLoss/Dice兼容（这些logits对应概率融合后的分类）
+
+            # 调试信息
+            # if self.training and torch.rand(1).item() < 0.01:  # 1%概率打印调试信息
+            #     print(f"Multi-scale GEM Debug - evidence_maps: {len(evidence_maps)} stages")
+            #     print(f"Multi-scale GEM Debug - concatenated_evidence: {concatenated_evidence.shape}")
+            #     print(f"Multi-scale GEM Debug - evidential_output: {evidential_output.shape}")
+
+            # 只保留最终输出为主，深监督可选择开启但降权
+            outputs_all = [evidential_output]
+            return outputs_all, None
+        else:
+            # 回退：若概率路径未产生输出，则退回HARMF标准路径
+            return self.harmf_encoder(x)
 
     def get_uncertainty_map(self, x):
         """
@@ -213,9 +332,9 @@ class HAEFNet(nn.Module):
                 for mod_idx in range(self.num_parallel):
                     if mod_idx < len(modality_features) and stage_idx < len(modality_features[mod_idx]):
                         feat = modality_features[mod_idx][stage_idx]
-                        projected_feat = self.feature_projections[stage_idx](feat)
-                        mass = self.gem_layers[stage_idx](projected_feat)
-                        uncertainty = self.gem_layers[stage_idx].get_uncertainty(mass)
+                        gem = self.gem_layers[stage_idx]
+                        mass = gem(feat)
+                        uncertainty = gem.get_uncertainty(mass)
                         stage_uncertainty.append(uncertainty)
 
                 if stage_uncertainty:

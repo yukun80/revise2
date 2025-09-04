@@ -29,6 +29,39 @@ class ModalityReliabilityGating(nn.Module):
         pl_hat = 1.0 - beta_b + beta_b * pl
         return pl_hat
 
+    def discount_mass(self, mass: torch.Tensor, modality_index: int) -> torch.Tensor:
+        """
+        Discount a Dempster-Shafer mass function using a modality-level reliability r in (0,1).
+
+        DS discounting (scalar r):
+          - m'_i     = r * m_i        for singleton classes i
+          - m'_Theta = (1 - r) + r * m_Theta
+
+        For stability and consistency, we derive r from per-class alphas by averaging
+        sigmoid(alpha) across classes for the given modality.
+
+        Args:
+            mass: [B, K+1, H, W]
+            modality_index: int
+        Returns:
+            discounted mass: [B, K+1, H, W]
+        """
+        B, Kp1, H, W = mass.size()
+        K = self.num_classes
+        assert Kp1 == K + 1, "Mass tensor must have K+1 channels (including Theta)."
+
+        # reliability scalar r in (0,1) for this modality
+        r = torch.sigmoid(self.alpha[modality_index]).mean()
+        r = r.to(dtype=mass.dtype, device=mass.device)
+
+        singletons = mass[:, :K, :, :]
+        m_theta = mass[:, K : K + 1, :, :]
+
+        discounted_singletons = singletons * r
+        discounted_theta = (1.0 - r) + r * m_theta
+
+        return torch.cat([discounted_singletons, discounted_theta], dim=1)
+
     @staticmethod
     def fuse_discounted_pl(pl_list):
         if not isinstance(pl_list, (list, tuple)) or len(pl_list) == 0:

@@ -75,60 +75,166 @@ class _GeoDsFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        # 简化版本：使用自动微分
-        # 在实际应用中，如果需要更精确的梯度，可以实现完整的反向传播
+        """
+        完整的2D Dempster-Shafer反向传播实现（从nnFormer 3D版本移植并适配2D）
+        对应的张量形状：
+          - input_feats: [B, C_in, H, W]
+          - W (prototype centers): [P, C_in]
+          - BETA (class membership): [P, M]
+          - alpha: [P, 1]
+          - gamma: [P, 1]
+          - mk: [M+1, B, H, W]   （未归一化的组合质量，用于反向计算）
+          - d: [P, B, H, W]
+        grad_output 来自前向输出 mk_n: [B, M+1, H, W]
+        """
         input_feats, W, BETA, alpha, gamma, mk, d = ctx.saved_tensors
 
-        # 计算简单的数值梯度作为近似
-        grad_input = None
-        grad_prototype_centers = None
-        grad_class_membership = None
-        grad_alpha = None
-        grad_gamma = None
+        grad_input = grad_W = grad_BETA = grad_alpha = grad_gamma = None
 
+        # 别名与形状
+        M = BETA.size(1)  # 类别数（不含Theta）
+        prototype_dim = W.size(0)
+        batch_size, in_channel, height, width = input_feats.size()
+
+        mu = 0  # 正则项系数（与原实现一致）
+        iw = 1  # 是否优化原型中心（与原实现一致）
+
+        # 只对类别通道（不包含Theta）的梯度进行缩放（与原实现一致）
+        grad_output_ = grad_output[:, :M, :, :] * (batch_size * M * height * width)
+
+        # 重新计算辅助量
+        K = mk.sum(0).unsqueeze(0)  # [1, B, H, W]
+        K2 = K**2
+        BETA2 = BETA * BETA
+        beta2 = BETA2.t().sum(0).unsqueeze(1)  # [M, 1]
+        U = BETA2 / (beta2 * torch.ones(1, M, device=input_feats.device))  # [P, M]
+        alphap = 0.99 / (1 + torch.exp(-alpha))  # [P, 1]
+        I = torch.eye(M, device=grad_output.device)
+
+        # 分配工作张量（2D版本）
+        s = torch.zeros(prototype_dim, batch_size, height, width, device=input_feats.device)
+        expo = torch.zeros(prototype_dim, batch_size, height, width, device=input_feats.device)
+        mm = torch.cat(
+            (
+                torch.zeros(M, batch_size, height, width, device=input_feats.device),
+                torch.ones(1, batch_size, height, width, device=input_feats.device),
+            ),
+            0,
+        )  # [M+1, B, H, W]
+
+        dEdm = torch.zeros(M + 1, batch_size, height, width, device=input_feats.device)
+        dU = torch.zeros(prototype_dim, M, device=input_feats.device)
+        Ds = torch.zeros(prototype_dim, batch_size, height, width, device=input_feats.device)
+        DW = torch.zeros(prototype_dim, in_channel, device=input_feats.device)
+
+        # 对单例质量和Theta质量的 dE/dm
+        for p in range(M):
+            dEdm[p, :] = (
+                grad_output_.permute(1, 0, 2, 3)
+                * (
+                    I[:, p].unsqueeze(1).unsqueeze(2).unsqueeze(3) * K
+                    - mk[:M, :]
+                    - (1.0 / M) * (torch.ones(M, 1, height, width, device=input_feats.device) * mk[M, :])
+                )
+            ).sum(0) / (K2 + 1e-12)
+
+        dEdm[M, :] = (
+            (
+                grad_output_.permute(1, 0, 2, 3)
+                * (-mk[:M, :] + (1.0 / M) * torch.ones(M, 1, height, width, device=input_feats.device) * (K - mk[M, :]))
+            ).sum(0)
+        ) / (K2 + 1e-12)
+
+        # 遍历每个原型，计算对各参数的梯度
+        for k in range(prototype_dim):
+            expo[k, :] = torch.exp(-gamma[k] ** 2 * d[k, :])  # [B, H, W]
+            s[k] = alphap[k] * expo[k, :]  # [B, H, W]
+            m = torch.cat(
+                (
+                    U[k, :].unsqueeze(1).unsqueeze(2).unsqueeze(3) * s[k, :],
+                    torch.ones(1, batch_size, height, width, device=input_feats.device) - s[k, :],
+                ),
+                0,
+            )  # [M+1, B, H, W]
+
+            mm[M, :] = mk[M, :] / (m[M, :] + 1e-12)
+            L = torch.ones(M, 1, height, width, device=input_feats.device) * mm[M, :]
+            mm[:M, :] = (mk[:M, :] - L * m[:M, :]) / (
+                m[:M, :] + torch.ones(M, 1, height, width, device=input_feats.device) * m[M, :] + 1e-12
+            )
+            R = mm[:M, :] + L
+            A = R * torch.ones(M, 1, height, width, device=input_feats.device) * s[k, :]
+            B = (
+                U[k, :].unsqueeze(1).unsqueeze(2).unsqueeze(3)
+                * torch.ones(1, batch_size, height, width, device=input_feats.device)
+                * R
+                - mm[:M, :]
+            )
+
+            dU[k, :] = torch.mean((A * dEdm[:M, :]).view(M, -1).permute(1, 0), 0)
+            Ds[k, :] = (dEdm[:M, :] * B).sum(0) - (dEdm[M, :] * mm[M, :])
+
+            # 原型中心梯度（DW）
+            tt1 = Ds[k, :] * (gamma[k] ** 2) * s[k, :]  # [B, H, W]
+            tt2 = (torch.ones(batch_size, 1, device=input_feats.device) * W[k, :]).unsqueeze(2).unsqueeze(
+                3
+            ) - input_feats  # [B, C, H, W]
+            tt1 = tt1.view(1, -1)
+            tt2 = tt2.permute(1, 0, 2, 3).reshape(in_channel, batch_size * height * width).permute(1, 0)
+            DW[k, :] = -torch.mm(tt1, tt2)
+
+        # 归一化原型中心梯度
+        DW = iw * DW / (batch_size * height * width)
+
+        # 类别隶属度（BETA）梯度
+        T = beta2 * torch.ones(1, M, device=input_feats.device)
+        Dbeta = (2 * BETA / (T**2)) * (
+            dU * (T - BETA2)
+            - (dU * BETA2).sum(1).unsqueeze(1) * torch.ones(1, M, device=input_feats.device)
+            + dU * BETA2
+        )
+
+        # gamma 与 alpha 的梯度
+        Dgamma = -2 * torch.mean(((Ds * d * s).view(prototype_dim, -1)).t(), 0).unsqueeze(1) * gamma
+        Dalpha = (torch.mean(((Ds * expo).view(prototype_dim, -1)).t(), 0).unsqueeze(1) + mu) * (
+            0.99 * (1 - alphap) * alphap
+        )
+
+        # 输入特征的梯度
+        Dinput = torch.zeros(batch_size, in_channel, height, width, device=input_feats.device)
+        temp2 = torch.zeros(prototype_dim, in_channel, height, width, device=input_feats.device)
+        for n in range(batch_size):
+            for k in range(prototype_dim):
+                diff = input_feats[n, :] - W[k, :].unsqueeze(0).unsqueeze(2).unsqueeze(3)
+                coeff = (Ds[k, n, :, :] * (gamma[k] ** 2) * s[k, n, :, :]).unsqueeze(0).unsqueeze(1)
+                temp2[k] = -prototype_dim * coeff * diff
+            Dinput[n, :] = temp2.mean(0)
+
+        # 按需返回梯度
         if ctx.needs_input_grad[0]:
-            # 对输入特征的梯度
-            grad_input = torch.autograd.grad(
-                _GeoDsFunction.apply(input_feats, W, BETA, alpha, gamma).sum(),
-                input_feats,
-                retain_graph=True,
-                create_graph=True,
-            )[0]
-
+            grad_input = Dinput
         if ctx.needs_input_grad[1]:
-            # 对原型中心的梯度
-            grad_prototype_centers = torch.autograd.grad(
-                _GeoDsFunction.apply(input_feats, W, BETA, alpha, gamma).sum(), W, retain_graph=True, create_graph=True
-            )[0]
-
+            grad_W = DW
         if ctx.needs_input_grad[2]:
-            # 对类别隶属度的梯度
-            grad_class_membership = torch.autograd.grad(
-                _GeoDsFunction.apply(input_feats, W, BETA, alpha, gamma).sum(),
-                BETA,
-                retain_graph=True,
-                create_graph=True,
-            )[0]
-
+            grad_BETA = Dbeta
         if ctx.needs_input_grad[3]:
-            # 对alpha的梯度
-            grad_alpha = torch.autograd.grad(
-                _GeoDsFunction.apply(input_feats, W, BETA, alpha, gamma).sum(),
-                alpha,
-                retain_graph=True,
-                create_graph=True,
-            )[0]
-
+            grad_alpha = Dalpha
         if ctx.needs_input_grad[4]:
-            # 对gamma的梯度
-            grad_gamma = torch.autograd.grad(
-                _GeoDsFunction.apply(input_feats, W, BETA, alpha, gamma).sum(),
-                gamma,
-                retain_graph=True,
-                create_graph=True,
-            )[0]
+            grad_gamma = Dgamma
 
-        return grad_input, grad_prototype_centers, grad_class_membership, grad_alpha, grad_gamma
+        # 保证梯度张量连续，避免后端报错
+        if grad_input is not None:
+            grad_input = grad_input.contiguous()
+        if grad_W is not None:
+            grad_W = grad_W.contiguous()
+        if grad_BETA is not None:
+            grad_BETA = grad_BETA.contiguous()
+        if grad_alpha is not None:
+            grad_alpha = grad_alpha.contiguous()
+        if grad_gamma is not None:
+            grad_gamma = grad_gamma.contiguous()
+
+        return grad_input, grad_W, grad_BETA, grad_alpha, grad_gamma
 
 
 class GeoEvidentialMappingLayer(nn.Module):
@@ -173,15 +279,15 @@ class GeoEvidentialMappingLayer(nn.Module):
 
     def reset_parameters(self):
         """初始化参数"""
-        # 核心参数初始化
-        nn.init.normal_(self.prototype_centers, std=0.1)
+        # 核心参数初始化 - 更合理的初始化
+        nn.init.normal_(self.prototype_centers, std=0.01)  # 减小初始化方差
         nn.init.xavier_uniform_(self.class_membership)
-        nn.init.constant_(self.gamma, 0.1)
-        nn.init.constant_(self.alpha, 0.0)
+        nn.init.constant_(self.gamma, 0.1)  # 更小的gamma，避免指数项过度衰减
+        nn.init.constant_(self.alpha, 0.0)  # 更小的alpha，避免s_act饱和
 
         # 地理先验初始化
-        nn.init.normal_(self.geo_constraints, std=0.05)
-        nn.init.normal_(self.seasonal_weights, std=0.05)
+        nn.init.normal_(self.geo_constraints, std=0.01)
+        nn.init.normal_(self.seasonal_weights, std=0.01)
         nn.init.constant_(self.terrain_complexity_weight, 1.0)
 
     def forward(self, feats: torch.Tensor, geo_context: torch.Tensor = None) -> torch.Tensor:
@@ -214,35 +320,9 @@ class GeoEvidentialMappingLayer(nn.Module):
         U = BETA2 / (beta2.unsqueeze(1) * torch.ones(1, K, device=device))  # [P, K]
         alphap = 0.99 / (1 + torch.exp(-self.alpha))  # [P, 1]
 
-        # 高效距离: d = 0.5*(||x||^2 - 2 x·p + ||p||^2)
-        x_sq = (feats * feats).sum(1, keepdim=True)  # [B, 1, H, W]
-        weight = adjusted_centers.view(P, C, 1, 1)  # [P, C, 1, 1]
-        x_dot_p = F.conv2d(feats, weight)  # [B, P, H, W]
-        p_sq = (adjusted_centers * adjusted_centers).sum(1).view(1, P, 1, 1)  # [1, P, 1, 1]
-        d = 0.5 * (x_sq - 2.0 * x_dot_p + p_sq)  # [B, P, H, W]
-
-        # s_act: [B, P, H, W]
-        expo = torch.exp(-(self.gamma.view(1, P, 1, 1) ** 2) * d)
-        s_act = alphap.view(1, P, 1, 1) * expo
-
-        # 初始化 mk: [B, K+1, H, W]
-        mk = torch.cat((torch.zeros(B, K, H, W, device=device), torch.ones(B, 1, H, W, device=device)), 1)
-
-        # 逐原型组合
-        for p in range(P):
-            # m_k for prototype p: [B, K+1, H, W]
-            m_singletons = s_act[:, p : p + 1, :, :] * U[p, :].view(1, K, 1, 1)  # [B, K, H, W]
-            m_theta = 1.0 - s_act[:, p : p + 1, :, :]  # [B, 1, H, W]
-            m_k = torch.cat((m_singletons, m_theta), 1)
-
-            t2 = mk[:, :K, :, :] * (m_k[:, :K, :, :] + m_k[:, K : K + 1, :, :])
-            t3 = m_k[:, :K, :, :] * mk[:, K : K + 1, :, :]
-            t4 = mk[:, K : K + 1, :, :] * m_k[:, K : K + 1, :, :]
-            mk = torch.cat((t2 + t3, t4), 1)
-
-        K_sum = mk.sum(1, keepdim=True)  # [B, 1, H, W]
-        mk_n = mk / (K_sum + 1e-12)
-        return mk_n
+        # 使用自定义的DS函数（包含完整的反向传播）
+        mass = _GeoDsFunction.apply(feats, adjusted_centers, BETA, self.alpha, self.gamma)
+        return mass
 
     def _apply_geo_prior(self, prototype_centers: torch.Tensor, geo_context: torch.Tensor) -> torch.Tensor:
         """

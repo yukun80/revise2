@@ -5,14 +5,15 @@ import datetime
 import numpy as np
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch import distributed as dist
 from argparse import ArgumentParser
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter  # 添加TensorBoard支持
 
 from utils.multimodal_dataset import MultiModalRSDataset
-from utils.augmentations_mm import get_train_augmentation, get_val_augmentation
+from utils.augmentations_traditional import (
+    get_traditional_train_augmentation,
+    get_traditional_val_augmentation,
+)
 from utils.loss_factory import LossFactory
 from models.model_factory import create_model  # Import the model factory
 from utils.optimizer import PolyWarmupAdamW, CosineAnnealingWarmupAdamW
@@ -51,30 +52,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def setup_ddp(args):
-    """设置DDP，支持单机单卡和分布式训练"""
-    # 检查是否在分布式环境中
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        args.rank = int(os.environ["RANK"])
-        args.world_size = int(os.environ["WORLD_SIZE"])
-        args.gpu = int(os.environ["LOCAL_RANK"])
-
-        # 分布式环境设置
-        torch.cuda.set_device(args.gpu)
-        dist.init_process_group(
-            backend="nccl",
-            init_method="env://",
-            world_size=args.world_size,
-            rank=args.rank,
-            timeout=datetime.timedelta(seconds=7200),
-        )
-    else:
-        # 单机单卡设置
-        args.rank = 0
+# 单机单卡：不需要分布式初始化
+def setup_device(args):
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
         args.gpu = 0
-        args.world_size = 1
-        torch.cuda.set_device(args.gpu)
-
+    else:
+        args.gpu = None
     return args
 
 
@@ -97,7 +81,11 @@ def create_dataloader(config, is_train=True):
             root_dir=root_dir,
             file_list=file_list,  # 使用完整路径
             modalities=modalities,
-            transform=get_train_augmentation(norm_config) if is_train else get_val_augmentation(norm_config),
+            transform=(
+                get_traditional_train_augmentation(norm_config)
+                if is_train
+                else get_traditional_val_augmentation(norm_config)
+            ),
             stage="train" if is_train else "val",
         )
 
@@ -105,8 +93,8 @@ def create_dataloader(config, is_train=True):
         if len(dataset) == 0:
             raise RuntimeError("Dataset is empty!")
 
-        # 创建数据加载器
-        sampler = torch.utils.data.distributed.DistributedSampler(dataset) if dist.is_initialized() else None
+        # 创建数据加载器（单机单卡，无分布式采样器）
+        sampler = None
 
         dataloader = DataLoader(
             dataset,
@@ -133,8 +121,8 @@ def train_epoch(model, dataloader, optimizer, criterion, epoch, writer=None, pri
 
     with tqdm(total=len(dataloader)) as pbar:
         for i, (images, labels, meta) in enumerate(dataloader):
-            images = [img.cuda() for img in images]
-            labels = labels.cuda()
+            images = [img.cuda() for img in images] if torch.cuda.is_available() else images
+            labels = labels.cuda() if torch.cuda.is_available() else labels
 
             # 获取模型输出
             outputs, aux_loss = model(images)
@@ -166,7 +154,7 @@ def train_epoch(model, dataloader, optimizer, criterion, epoch, writer=None, pri
             pbar.update(1)
 
             # 记录到TensorBoard
-            if writer and (dist.get_rank() == 0 if dist.is_initialized() else True):
+            if writer:
                 global_step = epoch * len(dataloader) + i
                 writer.add_scalar("Train/BatchLoss", total_loss_value.item(), global_step)
                 writer.add_scalar("Train/TaskLoss", total_loss_value.item(), global_step)
@@ -176,7 +164,7 @@ def train_epoch(model, dataloader, optimizer, criterion, epoch, writer=None, pri
                 writer.add_scalar("Train/LearningRate", current_lr, global_step)
 
     # 记录每个epoch的平均损失
-    if writer and (dist.get_rank() == 0 if dist.is_initialized() else True):
+    if writer:
         writer.add_scalar("Train/EpochLoss", batch_loss.avg, epoch)
 
     return total_loss / len(dataloader)
@@ -244,8 +232,8 @@ def validate(model, dataloader, criterion, epoch=0, writer=None):
 
     with torch.no_grad():
         for i, (images, labels, meta) in enumerate(dataloader):
-            images = [img.cuda() for img in images]
-            labels = labels.cuda()
+            images = [img.cuda() for img in images] if torch.cuda.is_available() else images
+            labels = labels.cuda() if torch.cuda.is_available() else labels
 
             # 获取模型输出
             outputs, aux_loss = model(images)
@@ -262,10 +250,11 @@ def validate(model, dataloader, criterion, epoch=0, writer=None):
                 total_loss_value = task_loss
 
             # 处理模型输出用于评估
-            if use_feature_fusion:
-                ensemble_output = outputs[0] if isinstance(outputs, list) else outputs
+            # 统一从列表或张量中取主输出
+            if isinstance(outputs, list):
+                ensemble_output = outputs[-1]
             else:
-                ensemble_output = outputs[-1] if len(outputs) > 1 else outputs[0]
+                ensemble_output = outputs
 
             # 更新损失指标
             batch_loss.update(total_loss_value.item())
@@ -297,7 +286,7 @@ def validate(model, dataloader, criterion, epoch=0, writer=None):
     overall_acc, class_acc, iou = getScores(conf_mat)
 
     # 记录验证指标
-    if writer and (dist.get_rank() == 0 if dist.is_initialized() else True):
+    if writer:
         writer.add_scalar("Val/Loss", batch_loss.avg, epoch)
         writer.add_scalar("Val/Accuracy", overall_acc, epoch)
         writer.add_scalar("Val/mIoU", iou, epoch)
@@ -353,36 +342,29 @@ def main():
     with open(args.config, "w") as f:
         yaml.safe_dump(config, f, default_flow_style=False)
 
-    # 设置分布式训练
-    args = setup_ddp(args)
+    # 设置设备（单机单卡）
+    args = setup_device(args)
 
     # 创建TensorBoard日志目录
     log_dir = os.path.join(
         config["training"].get("log_dir", "logs"), config["training"]["name"] + "_" + config["training"]["current_time"]
     )
 
-    # 仅在主进程中创建SummaryWriter
-    writer = None
-    if dist.is_initialized():
-        if dist.get_rank() == 0:
-            writer = SummaryWriter(log_dir)
-            print_log(f"TensorBoard logs will be saved to {log_dir}")
-    else:
-        writer = SummaryWriter(log_dir)
-        print_log(f"TensorBoard logs will be saved to {log_dir}")
+    # 创建SummaryWriter
+    writer = SummaryWriter(log_dir)
+    print_log(f"TensorBoard logs will be saved to {log_dir}")
 
     # 创建模型
     model = create_model(config)
-    model = model.cuda()
-    if dist.is_initialized():
-        model = DDP(model, device_ids=[args.gpu])
+    if torch.cuda.is_available():
+        model = model.cuda()
 
     # 创建数据加载器
     train_loader, train_sampler = create_dataloader(config, is_train=True)
     val_loader, _ = create_dataloader(config, is_train=False)
 
     # 创建优化器
-    param_groups = model.module.get_param_groups() if dist.is_initialized() else model.get_param_groups()
+    param_groups = model.get_param_groups()
 
     scheduler_type = config["training"].get("scheduler", {}).get("type", "polynomial")
 
@@ -450,13 +432,12 @@ def main():
     )
 
     # 记录学习率
-    if writer and dist.get_rank() == 0 if dist.is_initialized() else True:
+    if writer:
         writer.add_scalar("Train/LearningRate", config["training"]["learning_rate"], 0)
 
     # 训练循环
     for epoch in range(config["training"]["num_epochs"]):
-        if train_sampler:
-            train_sampler.set_epoch(epoch)
+        # 单机单卡，无需设置采样器 epoch
 
         # 训练一个epoch - 保持原始函数调用
         train_loss = train_epoch(model, train_loader, optimizer, criterion, epoch, writer)
@@ -469,46 +450,6 @@ def main():
             )
 
             # 保存模型
-            if dist.is_initialized():
-                if dist.get_rank() == 0:
-                    saver.save(
-                        val_iou,  # 使用IoU而不是loss
-                        {
-                            "model": model.module.state_dict(),
-                            "epoch": epoch,
-                        },
-                        epoch=epoch,  # 传递当前epoch
-                    )
-            else:
-                saver.save(
-                    val_iou,  # 使用IoU而不是loss
-                    {
-                        "model": model.state_dict(),
-                        "epoch": epoch,
-                    },
-                    epoch=epoch,  # 传递当前epoch
-                )
-
-    # 关闭TensorBoard writer
-    if writer:
-        writer.close()
-
-    if dist.is_initialized():
-        dist.destroy_process_group()
-        print_log(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Val IoU = {val_iou:.4f}%")
-
-        # 保存模型
-        if dist.is_initialized():
-            if dist.get_rank() == 0:
-                saver.save(
-                    val_iou,
-                    {
-                        "model": model.module.state_dict(),
-                        "epoch": epoch,
-                    },
-                    epoch=epoch,
-                )
-        else:
             saver.save(
                 val_iou,
                 {
@@ -521,9 +462,16 @@ def main():
     # 关闭TensorBoard writer
     if writer:
         writer.close()
-
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    print_log(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, Val IoU = {val_iou:.4f}%")
+    # 最终保存模型
+    saver.save(
+        val_iou,
+        {
+            "model": model.state_dict(),
+            "epoch": epoch,
+        },
+        epoch=epoch,
+    )
 
 
 if __name__ == "__main__":

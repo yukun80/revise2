@@ -8,3 +8,6 @@ pretrained/
 *.tif
 logs/
 README.md
+*.npy
+*.png
+*.csv

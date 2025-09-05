@@ -10,7 +10,7 @@ model:
   backbone: swin_tiny
   drop_path_rate: 0.2
   drop_rate: 0.0
-  gem_geo_prior_weight: 0.1
+  gem_geo_prior_weight: 0
   gem_prototype_dim: 20
   modality_dims:
     dem: 3
@@ -47,17 +47,17 @@ model:
   num_classes: 2
   num_modalities: 3
   pretrained: true
+  prob_fusion: mean
   type: haefnet
-  use_evidential_combination: true
   use_evidential_fusion: true
   use_mrg: true
 prediction:
-  model_path: checkpoints/HAEFNet_test_20250903/model_epoch_20.pth
-  output_dir: work_dir/HAEFNet_test_20250903_pred_best
+  model_path: checkpoints/HAEFNet_test_20250904/model_best.pth
+  output_dir: work_dir/HAEFNet_test_20250904_pred_best
 training:
   batch_size: 8
   ckpt_dir: checkpoints/
-  current_time: '20250904'
+  current_time: '20250905'
   learning_rate: 1.0e-05
   log_dir: logs/
   loss:
@@ -69,7 +69,7 @@ training:
       weight: 1.0
     type: combined
   name: HAEFNet_test
-  num_epochs: 50
+  num_epochs: 100
   num_workers: 8
   save_interval: 5
   scheduler:

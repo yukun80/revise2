@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from .segformer import WeTr
 from .geo_evidential_mapping import GeoEvidentialMappingLayer
 from .modality_reliability_gating import ModalityReliabilityGating
-from .evidential_combination import fuse_discounted_plausibilities, normalize_pl_to_prob
 
 
 class HAEFNet(nn.Module):
@@ -30,7 +29,8 @@ class HAEFNet(nn.Module):
         # 是否使用证据融合
         use_evidential_fusion=True,
         use_mrg=False,
-        use_evidential_combination=False,
+        # 概率融合策略：product | mean | weighted_product
+        prob_fusion: str = "product",
     ):
         super().__init__()
 
@@ -38,7 +38,7 @@ class HAEFNet(nn.Module):
         self.num_parallel = num_parallel
         self.use_evidential_fusion = use_evidential_fusion
         self.use_mrg = use_mrg
-        self.use_evidential_combination = use_evidential_combination
+        self.prob_fusion = prob_fusion
 
         print("-----------------HAEF-Net Params--------------------------------------")
         print("backbone:", backbone)
@@ -46,6 +46,7 @@ class HAEFNet(nn.Module):
         print("num_modalities:", num_parallel)
         print("use_evidential_fusion:", use_evidential_fusion)
         print("gem_prototype_dim:", gem_prototype_dim)
+        print("prob_fusion:", self.prob_fusion)
         print("--------------------------------------------------------------")
 
         # 1. HARMF编码器 (保持原有功能)
@@ -143,68 +144,6 @@ class HAEFNet(nn.Module):
 
         return param_groups
 
-    def _dempster_combination(self, evidence_list):
-        """
-        使用Dempster组合规则融合多个证据质量函数
-
-        Args:
-            evidence_list: List of [B, K+1, H, W] mass functions
-        Returns:
-            combined_evidence: [B, K+1, H, W] 组合后的质量函数
-        """
-        if len(evidence_list) == 1:
-            return evidence_list[0]
-
-        # 初始化组合结果
-        combined = evidence_list[0]
-
-        # 逐个组合证据
-        for evidence in evidence_list[1:]:
-            combined = self._dempster_combine_two(combined, evidence)
-
-        return combined
-
-    def _dempster_combine_two(self, m1, m2):
-        """
-        使用Dempster组合规则组合两个质量函数
-
-        Args:
-            m1, m2: [B, K+1, H, W] mass functions
-        Returns:
-            combined: [B, K+1, H, W] 组合后的质量函数
-        """
-        B, K_plus_1, H, W = m1.shape
-        K = K_plus_1 - 1  # 类别数
-        m1_theta = m1[:, -1:, :, :]  # [B, 1, H, W]
-        m2_theta = m2[:, -1:, :, :]  # [B, 1, H, W]
-        m1_singletons = m1[:, :-1, :, :]  # [B, K, H, W]
-        m2_singletons = m2[:, :-1, :, :]  # [B, K, H, W]
-
-        # 冲突 K = Σ_{i≠j} m1({i}) m2({j})
-        sum_m1 = m1_singletons.sum(dim=1, keepdim=True)  # [B,1,H,W]
-        sum_m2 = m2_singletons.sum(dim=1, keepdim=True)  # [B,1,H,W]
-        diag = (m1_singletons * m2_singletons).sum(dim=1, keepdim=True)  # [B,1,H,W]
-        conflict = (sum_m1 * sum_m2) - diag  # [B,1,H,W]
-
-        # 归一化分母 1 - K，数值稳定
-        denom = (1.0 - conflict).clamp(min=1e-6)
-
-        # 组合单例（向量化）：m({k}) = [m1_k*m2_k + m1_k*m2_Θ + m1_Θ*m2_k] / (1-K)
-        numer_singletons = (
-            m1_singletons * m2_singletons + m1_singletons * m2_theta + m1_theta * m2_singletons
-        )  # [B,K,H,W]
-        combined_singletons = numer_singletons / denom
-
-        # 组合 Theta：m(Θ) = [m1(Θ) * m2(Θ)] / (1-K)
-        numer_theta = m1_theta * m2_theta  # [B,1,H,W]
-        combined_theta = numer_theta / denom
-
-        combined = torch.cat([combined_singletons, combined_theta], dim=1)
-        # 保险起见再次归一化
-        combined = combined / (combined.sum(dim=1, keepdim=True) + 1e-12)
-
-        return combined
-
     def forward(self, x):
         """
         前向传播
@@ -280,15 +219,30 @@ class HAEFNet(nn.Module):
                     stage_probs.append(prob)
 
             if stage_probs:
-                # 概率路径（优先）: 按模态乘积并归一化
+                # 概率路径（优先）: 支持多种融合策略
                 if len(stage_probs) == 1:
                     fused_prob_s = stage_probs[0]
                     fused_uncertainty = stage_uncertainty[0]
                 else:
-                    fused_pl_s = stage_probs[0]
-                    for t in range(1, len(stage_probs)):
-                        fused_pl_s = fused_pl_s * stage_probs[t]
-                    fused_prob_s = fused_pl_s / (fused_pl_s.sum(1, keepdim=True) + 1e-12)
+                    if self.prob_fusion == "mean":
+                        fused_prob_s = torch.stack(stage_probs, dim=0).mean(dim=0)
+                    elif self.prob_fusion == "weighted_product" and hasattr(self, "mrg") and self.use_mrg:
+                        # 以 beta 作为权重的 PoE：prod p_i^w_i 后归一化
+                        with torch.no_grad():
+                            beta = torch.sigmoid(self.mrg.alpha).mean(dim=1, keepdim=False)  # [T,1,1]
+                            weights = beta.unsqueeze(1)  # [T,1,1,1]
+                            weights = weights[: len(stage_probs)]
+                            weights = weights.to(stage_probs[0].dtype).to(stage_probs[0].device)
+                        log_p = torch.stack([torch.log(p + 1e-12) for p in stage_probs], dim=0)
+                        wlog = log_p * weights
+                        fused_log = wlog.sum(dim=0)
+                        fused_pl_s = torch.exp(fused_log)
+                        fused_prob_s = fused_pl_s / (fused_pl_s.sum(1, keepdim=True) + 1e-12)
+                    else:
+                        fused_pl_s = stage_probs[0]
+                        for t in range(1, len(stage_probs)):
+                            fused_pl_s = fused_pl_s * stage_probs[t]
+                        fused_prob_s = fused_pl_s / (fused_pl_s.sum(1, keepdim=True) + 1e-12)
                     fused_uncertainty = torch.stack(stage_uncertainty, dim=0).mean(dim=0)
 
                 # 保存以便多尺度融合（注意这里保存的是概率 K 通道）
@@ -344,6 +298,205 @@ class HAEFNet(nn.Module):
         """
         if not self.use_evidential_fusion:
             return None
+
+    @torch.no_grad()
+    def analyze_modalities(self, x, foreground_class: int = 1, compute_loo: bool = True):
+        """
+        分析各模态贡献与不确定性，并可选计算留一法(LOO)融合结果。
+
+        Returns dict with:
+          - final_logits: [B,K,H,W]
+          - final_prob: [B,K,H,W]
+          - U: [B,1,H,W] 最终不确定性
+          - C_t: [B,T,H,W] 每模态log贡献(前景类) 跨stage平均
+          - U_t: [B,T,H,W] 每模态不确定性 跨stage平均
+          - prob_loo: list len T of [B,K,H,W] (可选)
+          - beta: [T,K] 可靠性参数sigmoid
+        """
+        original_shape = x[0].shape[2:]
+
+        modality_features = self.harmf_encoder.encoder(x)
+
+        num_modalities = len(modality_features)
+        stage_count = len(modality_features[0]) if num_modalities > 0 else 0
+
+        stage_fused_probs_all = []
+        stage_fused_probs_no_t = [[] for _ in range(self.num_parallel)] if compute_loo else None
+
+        per_modality_log_contrib_sum = [None for _ in range(self.num_parallel)]
+        per_modality_U_sum = [None for _ in range(self.num_parallel)]
+        per_modality_stage_counter = [0 for _ in range(self.num_parallel)]
+
+        stage_uncertainty_across_modalities = []
+
+        for stage_idx in range(stage_count):
+            stage_feats = []
+            for m in range(num_modalities):
+                if stage_idx < len(modality_features[m]):
+                    stage_feats.append(modality_features[m][stage_idx])
+
+            if not stage_feats:
+                continue
+
+            B, C, Hs, Ws = stage_feats[0].shape
+            seqs = [f.permute(0, 2, 3, 1).reshape(B, Hs * Ws, C) for f in stage_feats]
+
+            updated_seqs = list(seqs)
+            for m in range(num_modalities):
+                nxt = (m + 1) % num_modalities
+                y_m, y_n = self.harmf_encoder.pca_stages[stage_idx](updated_seqs[m], updated_seqs[nxt])
+                updated_seqs[m], updated_seqs[nxt] = y_m, y_n
+
+            updated_feats = [
+                updated_seqs[m].reshape(B, Hs, Ws, C).permute(0, 3, 1, 2).contiguous() for m in range(num_modalities)
+            ]
+
+            per_modality_probs = []
+            per_modality_theta = []
+
+            for mod_idx in range(self.num_parallel):
+                if mod_idx < len(updated_feats):
+                    feat = updated_feats[mod_idx]
+                    gem = self.gem_layers[stage_idx]
+                    mass = gem(feat)
+                    if self.use_mrg:
+                        mass = self.mrg.discount_mass(mass, modality_index=mod_idx)
+                    theta = gem.get_uncertainty(mass)  # [B,1,Hs,Ws]
+                    pl = gem.get_plausibility(mass)
+                    prob = pl / (pl.sum(1, keepdim=True) + 1e-12)
+
+                    per_modality_probs.append(prob)
+                    per_modality_theta.append(theta)
+
+                    # C_t 累积（log贡献，前景类）与 U_t 累积（跨stage平均）
+                    c_map = torch.log((prob[:, foreground_class : foreground_class + 1, :, :] + 1e-8)).squeeze(1)
+                    u_map = theta.squeeze(1)
+                    c_map = F.interpolate(
+                        c_map.unsqueeze(1), size=original_shape, mode="bilinear", align_corners=False
+                    ).squeeze(1)
+                    u_map = F.interpolate(
+                        u_map.unsqueeze(1), size=original_shape, mode="bilinear", align_corners=False
+                    ).squeeze(1)
+
+                    if per_modality_log_contrib_sum[mod_idx] is None:
+                        per_modality_log_contrib_sum[mod_idx] = c_map
+                        per_modality_U_sum[mod_idx] = u_map
+                    else:
+                        per_modality_log_contrib_sum[mod_idx] = per_modality_log_contrib_sum[mod_idx] + c_map
+                        per_modality_U_sum[mod_idx] = per_modality_U_sum[mod_idx] + u_map
+                    per_modality_stage_counter[mod_idx] += 1
+
+            # 跨模态不确定性（该stage）：先对theta取平均
+            if per_modality_theta:
+                stage_theta_mean = torch.stack(per_modality_theta, dim=0).mean(dim=0)
+                stage_theta_mean = F.interpolate(
+                    stage_theta_mean, size=original_shape, mode="bilinear", align_corners=False
+                )
+                stage_uncertainty_across_modalities.append(stage_theta_mean)
+
+            # 该stage融合(全部模态)
+            if per_modality_probs:
+                fused_pl_s = per_modality_probs[0]
+                for t in range(1, len(per_modality_probs)):
+                    fused_pl_s = fused_pl_s * per_modality_probs[t]
+                fused_prob_s = fused_pl_s / (fused_pl_s.sum(1, keepdim=True) + 1e-12)
+                stage_fused_probs_all.append(fused_prob_s)
+
+                # 留一法 per stage
+                if compute_loo:
+                    for t in range(self.num_parallel):
+                        if t < len(per_modality_probs):
+                            if self.prob_fusion == "mean":
+                                # 平均融合的留一法
+                                others = [per_modality_probs[j] for j in range(len(per_modality_probs)) if j != t]
+                                if len(others) > 0:
+                                    prob_no_t = torch.stack(others, dim=0).mean(dim=0)
+                                    stage_fused_probs_no_t[t].append(prob_no_t)
+                            else:
+                                # PoE留一法（含默认的product与weighted_product）
+                                prod_all = fused_pl_s * 1.0
+                                prod_no_t = prod_all / (per_modality_probs[t] + 1e-12)
+                                prob_no_t = prod_no_t / (prod_no_t.sum(1, keepdim=True) + 1e-12)
+                                stage_fused_probs_no_t[t].append(prob_no_t)
+
+        # 多尺度融合到最终输出
+        if not stage_fused_probs_all:
+            final_logits, _ = self.forward(x)
+            final_logits = final_logits[0]
+            final_prob = F.softmax(final_logits, dim=1)
+        else:
+            target_size = stage_fused_probs_all[0].shape[2:]
+            aligned = [
+                (
+                    p
+                    if p.shape[2:] == target_size
+                    else F.interpolate(p, size=target_size, mode="bilinear", align_corners=False)
+                )
+                for p in stage_fused_probs_all
+            ]
+            concatenated = torch.cat(aligned, dim=1)
+            final_logits = self.evidential_fusion(concatenated)
+            final_prob = F.softmax(final_logits, dim=1)
+
+        # 最终不确定性 U（跨stage跨模态平均）
+        if stage_uncertainty_across_modalities:
+            U = torch.stack(stage_uncertainty_across_modalities, dim=0).mean(dim=0)
+        else:
+            U = self.get_uncertainty_map(x)
+
+        # 每模态统计：C_t 与 U_t
+        C_list = []
+        U_list = []
+        for t in range(self.num_parallel):
+            if per_modality_stage_counter[t] > 0:
+                C_avg = per_modality_log_contrib_sum[t] / float(per_modality_stage_counter[t])
+                U_avg = per_modality_U_sum[t] / float(per_modality_stage_counter[t])
+            else:
+                C_avg = (
+                    torch.zeros(x[0].shape[0], *original_shape, device=final_prob.device)
+                    if per_modality_log_contrib_sum[t] is None
+                    else per_modality_log_contrib_sum[t]
+                )
+                U_avg = torch.zeros_like(C_avg)
+            C_list.append(C_avg.unsqueeze(1))
+            U_list.append(U_avg.unsqueeze(1))
+        C_t = torch.cat(C_list, dim=1) if C_list else None  # [B,T,H,W]
+        U_t = torch.cat(U_list, dim=1) if U_list else None
+
+        # 留一法最终概率
+        prob_loo = None
+        if compute_loo and stage_fused_probs_no_t is not None and stage_fused_probs_no_t[0]:
+            prob_loo = []
+            for t in range(self.num_parallel):
+                if stage_fused_probs_no_t[t]:
+                    aligned_no_t = [
+                        (
+                            p
+                            if p.shape[2:] == target_size
+                            else F.interpolate(p, size=target_size, mode="bilinear", align_corners=False)
+                        )
+                        for p in stage_fused_probs_no_t[t]
+                    ]
+                    concatenated_no_t = torch.cat(aligned_no_t, dim=1)
+                    logits_no_t = self.evidential_fusion(concatenated_no_t)
+                    prob_no_t = F.softmax(logits_no_t, dim=1)
+                    prob_loo.append(prob_no_t)
+                else:
+                    prob_loo.append(None)
+
+        beta = None
+        if hasattr(self, "mrg") and self.use_mrg:
+            beta = torch.sigmoid(self.mrg.alpha).squeeze(-1).squeeze(-1)  # [T,K]
+
+        return {
+            "final_logits": final_logits,
+            "final_prob": final_prob,
+            "U": U,
+            "C_t": C_t,
+            "U_t": U_t,
+            "prob_loo": prob_loo,
+            "beta": beta,
+        }
 
         with torch.no_grad():
             modality_features = self.harmf_encoder.encoder(x)

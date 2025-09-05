@@ -217,7 +217,31 @@ class TraditionalNormalize:
 
 
 # 导入原始Compose类以保持一致性
-from utils.augmentations_mm import Compose
+class Compose:
+    def __init__(self, transforms: list) -> None:
+        self.transforms = transforms
+
+    def __call__(self, sample: dict) -> dict:
+        # 验证数据格式
+        assert isinstance(sample, dict), "Sample must be a dictionary"
+        assert "label" in sample, "Sample must contain 'label' key"
+
+        # 获取所有模态数据的shape
+        modality_shapes = {k: v.shape for k, v in sample.items() if k not in ["metadata", "label", "file_id"]}
+
+        # 验证所有模态数据的空间维度一致
+        if len(modality_shapes) > 0:
+            first_shape = next(iter(modality_shapes.values()))[1:]  # 空间维度
+            for modality, shape in modality_shapes.items():
+                assert (
+                    shape[1:] == first_shape
+                ), f"Spatial dimensions mismatch for {modality}: {shape[1:]} vs {first_shape}"
+
+        # 应用变换
+        for transform in self.transforms:
+            sample = transform(sample)
+
+        return sample
 
 
 def get_traditional_train_augmentation(config=None):

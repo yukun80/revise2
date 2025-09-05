@@ -70,7 +70,7 @@ def create_model(config):
             gem_geo_prior_weight = config["model"].get("gem_geo_prior_weight", 0.1)
             use_evidential_fusion = config["model"].get("use_evidential_fusion", True)
             use_mrg = config["model"].get("use_mrg", False)
-            use_evidential_combination = config["model"].get("use_evidential_combination", False)
+            prob_fusion = config["model"].get("prob_fusion", "product")
 
             model = HAEFNet(
                 backbone=backbone,
@@ -84,7 +84,7 @@ def create_model(config):
                 gem_geo_prior_weight=gem_geo_prior_weight,
                 use_evidential_fusion=use_evidential_fusion,
                 use_mrg=use_mrg,
-                use_evidential_combination=use_evidential_combination,
+                prob_fusion=prob_fusion,
             )
         else:
             print("Creating model with PixelCrossAttention fusion")

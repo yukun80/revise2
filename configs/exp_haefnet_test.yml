@@ -57,7 +57,7 @@ prediction:
 training:
   batch_size: 8
   ckpt_dir: checkpoints/
-  current_time: '20250905'
+  current_time: '20250907'
   learning_rate: 1.0e-05
   log_dir: logs/
   loss:

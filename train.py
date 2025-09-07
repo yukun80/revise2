@@ -482,6 +482,7 @@ if __name__ == "__main__":
 1. 单机单卡训练:
 ```bash
 python train.py --config configs/exp_swin-HARMF_250524.yml
+python train.py --config configs/exp_haefnet_test.yml
 ```
 
 2. 分布式训练:

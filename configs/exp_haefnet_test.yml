@@ -52,12 +52,12 @@ model:
   use_evidential_fusion: true
   use_mrg: true
 prediction:
-  model_path: checkpoints/HAEFNet_test_20250904/model_best.pth
-  output_dir: work_dir/HAEFNet_test_20250904_pred_best
+  model_path: checkpoints/HAEFNet_test_20250909/model_best.pth
+  output_dir: work_dir/HAEFNet_test_20250909_pred_best
 training:
   batch_size: 8
   ckpt_dir: checkpoints/
-  current_time: '20250907'
+  current_time: '20250909'
   learning_rate: 1.0e-05
   log_dir: logs/
   loss:
@@ -69,7 +69,7 @@ training:
       weight: 1.0
     type: combined
   name: HAEFNet_test
-  num_epochs: 100
+  num_epochs: 250
   num_workers: 8
   save_interval: 5
   scheduler:

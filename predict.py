@@ -550,7 +550,7 @@ python predict.py --config configs/exp_swin-HARMF_250524.yml \
 # HAEF-Net 20250904
 python predict.py \
   --config configs/exp_haefnet_test.yml \
-  --model checkpoints/HAEFNet_test_20250904/model_best.pth \
-  --output work_dir/HAEFNet_test_20250904_pred_best
+  --model checkpoints/HAEFNet_test_20250909/model_best.pth \
+  --output work_dir/HAEFNet_test_20250909_pred_best
 
 """

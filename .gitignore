@@ -5,6 +5,8 @@ doc/
 __pycache__/
 mmcv_custom/
 pretrained/
+script/
+work_dir/
 *.tif
 logs/
 README.md
